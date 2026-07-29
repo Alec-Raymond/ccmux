@@ -1,0 +1,37 @@
+#!/bin/bash
+# claude-fleet — live board of every running Claude Code session.
+#
+# The built-in `claude agents` view lists only BACKGROUND sessions (started
+# with `claude --bg`). `claude agents --json` also reports interactive ones,
+# so this polls that and renders it. Ctrl-C to quit.
+#
+# Usage: claude-fleet [refresh-seconds]   (default 2)
+
+PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin"
+interval=${1:-2}
+
+cleanup() { printf '\033[?25h\n'; exit 0; }
+trap cleanup INT TERM
+printf '\033[?25l'  # hide cursor
+
+render() {
+  claude agents --json 2>/dev/null | jq -r '
+    def pad(n): (.[0:n]) as $s | $s + ((" " * (n - ($s | length))) // "");
+    sort_by(.status != "idle", .name)
+    | if length == 0 then "  no sessions running"
+      else .[]
+        | "  " + ((.status // "?") | pad(8))
+          + ((if .kind == "background" then "bg" else "" end) | pad(4))
+          + ((.name // "-") | pad(26))
+          + ((.cwd // "") | sub("^" + env.HOME; "~"))
+      end'
+}
+
+while :; do
+  body=$(render)
+  printf '\033[H\033[2J'  # cursor home, clear screen
+  printf '  CLAUDE CODE SESSIONS\n'
+  printf '  idle = waiting on you   busy = Claude is working   (ctrl-c quits)\n\n'
+  printf '%s\n' "$body"
+  sleep "$interval"
+done
