@@ -1,0 +1,20 @@
+#!/bin/bash
+# claude-close — close a Claude window. Bound to option-w in ~/.tmux.conf.
+#
+#   claude-close <session> <window-id>
+#
+# Refuses to close the launcher window. That window is what remains when every
+# instance is gone, and killing the last window would destroy the session.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+SESSION=${1:-}
+WIN=${2:-}
+[[ -n "$WIN" ]] || exit 0
+
+launcher=$(tmux display-message -p -t "$WIN" '#{@claude_launcher}' 2>/dev/null)
+if [[ "$launcher" == "1" ]]; then
+  tmux display-message "new-instance screen stays open" 2>/dev/null
+  exit 0
+fi
+
+tmux kill-window -t "$WIN" 2>/dev/null
+exit 0

@@ -1,0 +1,91 @@
+#!/bin/bash
+# claude-tab — Option-Tab between Claude instances, with a preview highlight.
+#
+#   claude-tab <session> next|prev
+#
+# A terminal never reports a modifier key being released, so the Cmd-Tab pattern
+# of "hold Option, tap Tab, release to commit" cannot be detected directly. This
+# approximates it: every press moves a highlighted candidate in the sidebar, and
+# the switch happens once you stop pressing for COMMIT seconds. Pressing again
+# inside that window keeps moving the highlight instead of switching.
+#
+# State lives in session options: @claude_tab_target is the highlighted window
+# index, @claude_tab_at is when it was set, @claude_tab_seq is a counter used so
+# only the newest press gets to commit.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+SESSION=${1:-}
+DIR=${2:-next}
+COMMIT=0.8
+[[ -n "$SESSION" ]] || exit 0
+
+# Instance windows in order. The launcher is not an instance, so it is skipped:
+# Option-Tab cycles Claude sessions, never the new-instance screen.
+list=$(tmux list-windows -t "$SESSION" \
+  -F '#{window_index} #{window_active} #{@claude_launcher}' 2>/dev/null \
+  | awk '$3 != "1" { print $1, $2 }')
+[[ -n "$list" ]] || exit 0
+
+idxs=($(printf '%s\n' "$list" | awk '{print $1}'))
+n=${#idxs[@]}
+(( n == 0 )) && exit 0
+
+# Wake every sidebar in the session so the highlight lands immediately instead of
+# waiting for its next one-second tick. "r" is arbitrary: any byte breaks the
+# sidebar's read and makes it redraw. Only sidebar panes are targeted, so this
+# can never type into a Claude prompt.
+wake() {
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && tmux send-keys -t "$p" -H 72 2>/dev/null
+  done < <(tmux list-panes -s -t "$SESSION" \
+    -F '#{pane_id} #{@claude_sidebar}' 2>/dev/null \
+    | awk '$2 == "1" { print $1 }')
+}
+
+now=$(date +%s)
+cur=$(tmux show-options -t "$SESSION" -qv @claude_tab_target 2>/dev/null)
+at=$(tmux show-options -t "$SESSION" -qv @claude_tab_at 2>/dev/null)
+# An old candidate is stale, so a fresh press starts from the window you are on.
+if [[ -z "$cur" || -z "$at" ]] || (( now - at > 2 )); then
+  cur=$(printf '%s\n' "$list" | awk '$2 == "1" { print $1; exit }')
+fi
+
+pos=-1
+for (( i = 0; i < n; i++ )); do
+  [[ "${idxs[$i]}" == "$cur" ]] && { pos=$i; break; }
+done
+
+if (( pos < 0 )); then
+  next=0                                   # on the launcher: go to the first
+elif [[ "$DIR" == "prev" ]]; then
+  next=$(( (pos - 1 + n) % n ))
+else
+  next=$(( (pos + 1) % n ))
+fi
+target=${idxs[$next]}
+
+seq=$(tmux show-options -t "$SESSION" -qv @claude_tab_seq 2>/dev/null)
+case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
+seq=$(( seq + 1 ))
+
+tmux set-option -t "$SESSION" @claude_tab_target "$target" 2>/dev/null
+tmux set-option -t "$SESSION" @claude_tab_at "$now" 2>/dev/null
+tmux set-option -t "$SESSION" @claude_tab_seq "$seq" 2>/dev/null
+wake
+
+# Commit after the quiet period, unless a later press superseded this one.
+(
+  sleep "$COMMIT"
+  live=$(tmux show-options -t "$SESSION" -qv @claude_tab_seq 2>/dev/null)
+  [[ "$live" == "$seq" ]] || exit 0
+  t=$(tmux show-options -t "$SESSION" -qv @claude_tab_target 2>/dev/null)
+  tmux set-option -t "$SESSION" -u @claude_tab_target 2>/dev/null
+  tmux set-option -t "$SESSION" -u @claude_tab_at 2>/dev/null
+  [[ -n "$t" ]] || exit 0
+  tmux select-window -t "$SESSION:$t" 2>/dev/null
+  pane=$(tmux list-panes -t "$SESSION:$t" \
+    -F '#{pane_id} #{@claude_sidebar}' 2>/dev/null \
+    | awk '$2 != "1" { print $1; exit }')
+  [[ -n "$pane" ]] && tmux select-pane -t "$pane" 2>/dev/null
+  wake
+) >/dev/null 2>&1 &

@@ -1,0 +1,33 @@
+#!/bin/bash
+# claude-new — show the new-instance screen.
+#
+# Selects the launcher window, creating it if it is missing. Used by the "+" row
+# in the sidebar and by ctrl-b C, so both land in the same place: the picker in
+# the main pane, where a Claude terminal would be. No floating popup.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+# A session name as $1 is enough on its own. Only fall back to asking tmux which
+# session is current, which needs to be running inside it. run-shell (how the key
+# bindings call this) does set TMUX but not TMUX_PANE, so requiring TMUX
+# unconditionally would have made this unusable from a plain shell.
+SESSION=${1:-}
+if [[ -z "$SESSION" ]]; then
+  [[ -n "${TMUX:-}" ]] || exit 0
+  SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+fi
+[[ -n "$SESSION" ]] || SESSION=claude
+
+idx=$(tmux list-windows -t "$SESSION" -F '#{window_index}|#{@claude_launcher}' \
+  2>/dev/null | awk -F'|' '$2 == "1" { print $1; exit }')
+
+if [[ -z "$idx" ]]; then
+  wid=$(tmux new-window -t "$SESSION" -c "$HOME" -n new -P -F '#{window_id}' \
+    "exec $HOME/.local/bin/claude-launcher" 2>/dev/null) || exit 0
+  idx=$(tmux display-message -p -t "$wid" '#{window_index}')
+fi
+
+tmux select-window -t "$SESSION:$idx" 2>/dev/null || exit 0
+# Land in the launcher pane, not its sidebar.
+pane=$(tmux list-panes -t "$SESSION:$idx" -F '#{pane_id} #{@claude_sidebar}' \
+  2>/dev/null | awk '$2 != "1" { print $1; exit }')
+[[ -n "$pane" ]] && tmux select-pane -t "$pane" 2>/dev/null

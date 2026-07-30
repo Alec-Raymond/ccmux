@@ -1,0 +1,39 @@
+#!/bin/bash
+# claude-pin-sidebar — hold every sidebar pane at a fixed width, debounced.
+#
+# tmux resizes panes proportionally, so the sidebar stretched with the terminal.
+# Correcting it on every resize event caused the flicker: dragging a window edge
+# fires the hook continuously, and each correction fought tmux's next
+# proportional resize, so the pane visibly snapped between two widths.
+#
+# This collapses a burst of resizes into ONE correction, applied after the size
+# stops changing. The first invocation becomes the worker and waits for quiet;
+# every invocation during that wait only marks work as pending, so no matter how
+# long the drag lasts the pane is resized once at the end.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+COLS=28
+QUIET=0.2                       # seconds of no new resize before acting
+LOCK="${TMPDIR:-/tmp}/claude-pin.lock"
+DIRTY="${TMPDIR:-/tmp}/claude-pin.dirty"
+
+# mkdir is atomic: whoever creates it is the worker, everyone else just flags
+# that another resize arrived and gets out of the way.
+if ! mkdir "$LOCK" 2>/dev/null; then
+  : > "$DIRTY"
+  exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null; /bin/rm -f "$DIRTY"' EXIT
+
+while :; do
+  /bin/rm -f "$DIRTY"
+  sleep "$QUIET"
+  [[ -e "$DIRTY" ]] || break     # nothing arrived while waiting: the size settled
+done
+
+tmux list-panes -a \
+  -F '#{pane_id} #{@claude_sidebar} #{pane_width} #{window_panes}' 2>/dev/null \
+  | awk -v c="$COLS" '$2 == "1" && $3 != c && $4 > 1 { print $1 }' \
+  | while IFS= read -r p; do
+      [[ -n "$p" ]] && tmux resize-pane -t "$p" -x "$COLS" 2>/dev/null
+    done
+exit 0
