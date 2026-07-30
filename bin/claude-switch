@@ -1,0 +1,56 @@
+#!/bin/bash
+# claude-switch — popup window picker. Bound to ctrl-b Tab in ~/.tmux.conf.
+# Shows every window in the session with its Claude state, then jumps to the
+# one whose number you press. Any other key closes the popup.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+[[ -n "$TMUX" ]] || exit 0
+
+session=$(tmux display-message -p '#{session_name}')
+
+DIM=$'\033[38;5;245m'
+WHT=$'\033[1;38;5;255m'
+AMB=$'\033[1;38;5;214m'
+BLU=$'\033[1;38;5;75m'
+RST=$'\033[0m'
+
+printf '%s<number> jump   x <number> close   n new window   esc cancel%s\n\n' \
+  "$DIM" "$RST"
+
+while IFS='|' read -r idx active state name path; do
+  [[ -z "$idx" ]] && continue
+  # Keep the marker text plain and pad it separately, so the colour codes
+  # cannot throw off the column alignment of the path that follows.
+  case "$state" in
+    needs-input) mtxt="! needs input" ; mcol="$AMB" ;;
+    done)        mtxt="* finished"    ; mcol="$BLU" ;;
+    *)           mtxt=""             ; mcol="" ;;
+  esac
+  cur=" "
+  [[ "$active" == "1" ]] && cur="▸"
+  printf '%s %s%-3s%s%-24s%s%s%s%*s%s%s\n' \
+    "$cur" "$WHT" "$idx" "$WHT" "${name:0:24}" "$RST" \
+    "$mcol" "$mtxt" "$(( 15 - ${#mtxt} ))" "" "$RST" \
+    "${DIM}${path/#$HOME/~}${RST}"
+done < <(tmux list-windows -t "$session" \
+  -F '#{window_index}|#{window_active}|#{@claude_state}|#{window_name}|#{pane_current_path}')
+
+printf '\n'
+IFS= read -rsn1 key
+case "$key" in
+  [0-9])
+    tmux select-window -t "$session:$key" 2>/dev/null || exit 0
+    pane=$(tmux list-panes -t "$session:$key" -F '#{pane_id} #{@claude_sidebar}' \
+      | awk '$2 != "1" { print $1; exit }')
+    [[ -n "$pane" ]] && tmux select-pane -t "$pane"
+    ;;
+  x|X)
+    # Close a window: kills its Claude pane and its sidebar together.
+    printf '%sclose which window? %s' "$AMB" "$RST"
+    IFS= read -rsn1 num
+    [[ "$num" == [0-9] ]] && tmux kill-window -t "$session:$num" 2>/dev/null
+    ;;
+  n|N)
+    # Close the popup and land on the launcher window's new-instance screen.
+    "$HOME/.local/bin/claude-new" "$session"
+    ;;
+esac

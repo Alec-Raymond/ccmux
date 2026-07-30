@@ -1,0 +1,26 @@
+#!/bin/bash
+# claude-launcher — the "new Claude Code instance" screen.
+#
+# Runs in the launcher window's main pane, which is the same spot a Claude
+# terminal occupies in every other window. Picking a directory opens a new
+# window running claude there and switches to it.
+#
+# The picker runs in a loop, so ctrl-c returns to this screen instead of killing
+# the pane. That matters because this window is what remains when every Claude
+# instance is gone: closing the last instance drops you here, not out of tmux.
+PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin"
+[[ -n "${TMUX:-}" ]] || { echo "claude-launcher must run inside tmux" >&2; exit 1; }
+
+# Tag the window so the sidebar leaves it out of the instance rows and never
+# auto-closes it, and so claude-new can find it.
+tmux set-option -w -t "$TMUX_PANE" @claude_launcher 1 2>/dev/null
+tmux rename-window -t "$TMUX_PANE" new 2>/dev/null
+
+# A handler rather than an ignore: SIG_IGN is inherited by children, which would
+# stop fzf from cancelling on ctrl-c. A trap resets to default in the child.
+trap ':' INT TERM
+
+while :; do
+  "$HOME/.local/bin/ccnew" --launcher
+  sleep 0.2
+done

@@ -1,0 +1,25 @@
+#!/bin/bash
+# claude-sidebar-toggle — show or hide the sidebar pane in one window.
+# Bound to ctrl-b b in ~/.tmux.conf, which passes the window id as $1.
+# run-shell expands #{window_id} but does not set TMUX_PANE, so the target has
+# to arrive as an argument.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+[[ -n "$TMUX" ]] || exit 0
+
+win=${1:-}
+if [[ -n "$win" ]]; then
+  set -- -t "$win"
+else
+  set --
+fi
+
+existing=$(tmux list-panes "$@" -F '#{pane_id} #{@claude_sidebar}' 2>/dev/null \
+  | awk '$2 == "1" { print $1; exit }')
+
+if [[ -n "$existing" ]]; then
+  tmux kill-pane -t "$existing"
+else
+  target=${win:+$win.}
+  tmux split-window -hbd -l 28 -t "${target}{top-left}" \
+    "exec $HOME/.local/bin/claude-sidebar"
+fi
