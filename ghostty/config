@@ -1,0 +1,35 @@
+# Config for /Applications/ccmux.app only. The real Ghostty reads
+# ~/.config/ghostty/config and is unaffected; this file is reached through
+# XDG_CONFIG_HOME, set in the app's Info.plist under LSEnvironment.
+
+# Launch straight into the board instead of a shell.
+command = /Users/alecraymond/.local/bin/ccmux
+
+# Names the window "ccmux" wherever macOS shows a window title.
+title = ccmux
+
+# Same look as your normal terminal.
+theme = Atom
+font-family = "JetBrainsMono Nerd Font"
+font-size = 18
+window-padding-x = 20
+window-padding-y = 20
+cursor-style = block
+cursor-style-blink = false
+mouse-hide-while-typing = true
+macos-titlebar-style = hidden
+macos-option-as-alt = left
+
+# Window size in cells, chosen to fit comfortably inside a 1920x1080 logical
+# display rather than fill it. At 18pt each cell is about 10.8 x 21 points, so
+# 200x50 came to roughly 2200x1090 points — wider and taller than the screen, and
+# macOS clamped it to the full display, which is why it opened looking fullscreen.
+# 110 columns still leaves the Claude pane 81 after the 28-column sidebar.
+window-width = 110
+window-height = 34
+
+# Open at that size every time. Without this, macOS state restoration can bring
+# back a window that was fullscreen previously, ignoring the size above. Change
+# to "default" if you would rather it remember how you last sized it.
+window-save-state = never
+fullscreen = false

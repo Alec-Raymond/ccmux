@@ -1,0 +1,59 @@
+#!/bin/bash
+# ccmux — open the tmux session that holds every Claude Code window.
+#
+#   ccmux                       attach to the "claude" session, creating it
+#   ccmux <dir> [dir...]        add one window per directory, running claude
+#                               in each, then attach
+#
+# Window 1 is the launcher: it shows the "new Claude Code instance" screen in the
+# spot a Claude terminal occupies, and it is never closed. Closing the last
+# instance therefore drops you back onto that screen rather than out of tmux.
+set -euo pipefail
+PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin"
+SESSION=claude
+
+# Absolute path to the claude executable: a tmux server passes new windows the
+# PATH it inherited at startup, which may not include ~/.local/bin.
+CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+if [[ -z "$CLAUDE_BIN" ]]; then
+  echo "ccmux: cannot find the claude executable on PATH" >&2
+  exit 1
+fi
+
+# Match ccnew: instances the board opens start in auto mode, so they are far less
+# likely to sit blocked on a routine permission prompt.
+CLAUDE_FLAGS="--permission-mode auto"
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux new-session -d -s "$SESSION" -c "$HOME" -n new \
+    "exec $HOME/.local/bin/claude-launcher"
+fi
+
+first=""
+for dir in "$@"; do
+  if [[ ! -d "$dir" ]]; then
+    echo "ccmux: no such directory: $dir" >&2
+    continue
+  fi
+  abs=$(cd "$dir" && pwd)
+  name=$(basename "$abs")
+  # Each directory given opens its own instance, including one already running
+  # there. This used to skip duplicates, which made a second instance in the same
+  # project impossible; passing the same directory twice now gives two.
+  [[ "$abs" == "$HOME" ]] && name=home
+  wid=$(tmux new-window -t "$SESSION" -c "$abs" -n "$name" \
+    -P -F '#{window_id}' "exec $CLAUDE_BIN $CLAUDE_FLAGS")
+  tmux set-option -w -t "$wid" @claude_dir "$abs"
+  [[ -z "$first" ]] && first=$wid
+done
+
+[[ -n "$first" ]] && tmux select-window -t "$first"
+
+if [[ -n "${TMUX:-}" ]]; then
+  tmux switch-client -t "$SESSION"
+else
+  # -d detaches any other client first, so the board lives in exactly one window.
+  # Without it a second launch mirrors the session and tmux clamps both windows
+  # to the smaller one's size.
+  tmux attach-session -d -t "$SESSION"
+fi

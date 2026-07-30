@@ -1,0 +1,165 @@
+#!/bin/bash
+# ccnew — open a Claude Code window in the tmux session board.
+#
+#   ccnew                 pick a directory from your recent projects
+#   ccnew --launcher      same, drawn as the full-pane "new instance" screen
+#   ccnew <dir>...        open those directories directly
+#
+# If a window is already open for a directory, this switches to it instead of
+# opening a second copy.
+set -uo pipefail
+PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin"
+
+LAUNCHER=0
+if [[ "${1:-}" == "--launcher" ]]; then
+  LAUNCHER=1
+  shift
+fi
+
+# Put the window in the current session when run inside tmux, otherwise in the
+# shared "claude" session that ccmux creates.
+SESSION=""
+if [[ -n "${TMUX:-}" ]]; then
+  SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+fi
+SESSION=${SESSION:-claude}
+
+# In launcher mode stderr lands in the pane, and the launcher loop redraws fzf
+# 0.2s later, so an error would flash past unread. Hold it on screen.
+die() {
+  echo "ccnew: $*" >&2
+  (( LAUNCHER )) && sleep 4
+  exit 1
+}
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  die "no tmux session \"$SESSION\" — run ccmux first"
+fi
+
+# Absolute path to the claude executable. A tmux server hands each new window the
+# PATH it inherited when the server started, which often lacks ~/.local/bin. In
+# that case "exec claude" fails, the pane dies at once, and because
+# remain-on-exit is off the window disappears with nothing shown — pressing enter
+# looks like it did nothing at all. Resolving the path here removes that
+# dependence, and a missing binary now reports itself.
+CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+[[ -n "$CLAUDE_BIN" ]] || die "cannot find the claude executable on PATH"
+
+# Flags for every instance the board opens. Auto mode lets Claude decide routine
+# permissions itself, so a window is far less likely to sit blocked on a prompt.
+# Other choices: acceptEdits, manual, dontAsk, plan, bypassPermissions.
+CLAUDE_FLAGS="--permission-mode auto"
+
+# Candidate directories, best first: places you have actually run Claude
+# (history.jsonl records an absolute cwd per prompt, oldest first, so reverse
+# it), then zoxide's frecency list. Duplicates dropped, order kept.
+candidates() {
+  {
+    jq -r '.project // empty' "$HOME/.claude/history.jsonl" 2>/dev/null | tail -r
+    zoxide query -l 2>/dev/null
+  } | awk '!seen[$0]++'
+}
+
+# How many windows are already open on a directory. Used only to annotate the
+# picker; it no longer changes what enter does. @claude_dir holds the full path,
+# so this stays exact when two projects share a folder name.
+windows_for_dir() {
+  tmux list-windows -t "$SESSION" -F '#{@claude_dir}' 2>/dev/null \
+    | awk -v d="$1" '$0 == d { n++ } END { print n + 0 }'
+}
+
+# Always opens a NEW instance, even when one is already running in that folder.
+# It used to switch to the existing window instead, which made a second instance
+# in the same project impossible. Switching is what the sidebar rows are for.
+open_dir() {
+  local abs="$1" wid name
+  name=$(basename "$abs")
+  # "alecraymond" as a window name reads as noise, same as in the alert titles.
+  [[ "$abs" == "$HOME" ]] && name=home
+  wid=$(tmux new-window -t "$SESSION" -c "$abs" -n "$name" \
+    -P -F '#{window_id}' "exec $CLAUDE_BIN $CLAUDE_FLAGS") || return 1
+  tmux set-option -w -t "$wid" @claude_dir "$abs"
+}
+
+# Build the picker list. A dot marks a directory that already has instances, with
+# a count once there is more than one. It is information, not a restriction.
+listing() {
+  local d n
+  while IFS= read -r d; do
+    [[ -d "$d" ]] || continue
+    n=$(windows_for_dir "$d")
+    if (( n > 1 )); then
+      printf '%d %s\n' "$n" "${d/#$HOME/~}"
+    elif (( n == 1 )); then
+      printf '● %s\n' "${d/#$HOME/~}"
+    else
+      printf '  %s\n' "${d/#$HOME/~}"
+    fi
+  done < <(candidates)
+}
+
+pick() {
+  local list out rc query sel header
+  list=$(listing)
+  [[ -z "$list" ]] && return 1
+
+  # Everything this function writes to stdout becomes its return value, because
+  # callers use sel=$(pick). Anything meant for the screen must go to /dev/tty
+  # instead — a stray escape sequence on stdout ends up prepended to the path.
+  if ! command -v fzf >/dev/null 2>&1; then
+    # Fallback if fzf is ever missing: numbered menu.
+    printf '%s\n' "$list" | nl -w2 -s' ' > /dev/tty
+    printf 'number: ' > /dev/tty
+    local n
+    read -r n < /dev/tty
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    sel=$(printf '%s\n' "$list" | sed -n "${n}p")
+    [[ -z "$sel" ]] && return 1
+    printf '%s' "${sel:2}"
+    return 0
+  fi
+
+  if (( LAUNCHER )); then
+    printf '\033[H\033[2J' > /dev/tty
+    header=$'NEW CLAUDE INSTANCE\n\nenter opens a new instance  ·  ● or a count = already running there  ·  type a path to open somewhere new\n'
+  else
+    header=$'enter opens a new instance  ·  ● or a count = already running there  ·  esc cancels'
+  fi
+
+  # --print-query puts the typed text on line 1 and any selection on line 2, so
+  # a path that matches nothing in the list can still be opened.
+  # --header-first puts the header above the prompt instead of under it. Passed
+  # unconditionally: an empty array expansion under "set -u" aborts on bash 3.2.
+  out=$(printf '%s\n' "$list" | fzf --height=100% --reverse --no-multi \
+    --header-first --print-query --prompt='open claude in > ' --header="$header")
+  rc=$?
+  (( rc == 130 )) && return 1          # esc or ctrl-c: cancelled
+  query=$(printf '%s\n' "$out" | sed -n 1p)
+  sel=$(printf '%s\n' "$out" | sed -n 2p)
+
+  if [[ -n "$sel" ]]; then
+    printf '%s' "${sel:2}"             # strip the two-column marker
+    return 0
+  fi
+  if [[ -n "$query" ]]; then
+    local q=${query/#\~/$HOME}
+    [[ -d "$q" ]] && { printf '%s' "$query"; return 0; }
+  fi
+  return 1
+}
+
+if (( $# > 0 )); then
+  for d in "$@"; do
+    if [[ ! -d "$d" ]]; then
+      echo "ccnew: no such directory: $d" >&2
+      continue
+    fi
+    open_dir "$(cd "$d" && pwd)"
+  done
+else
+  sel=$(pick) || exit 0
+  [[ -z "$sel" ]] && exit 0
+  abs=${sel/#\~/$HOME}
+  [[ -d "$abs" ]] || die "no such directory: $abs"
+  open_dir "$abs"
+fi
