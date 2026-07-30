@@ -1,0 +1,77 @@
+#!/bin/bash
+# claude-move — reorder the sidebar list. Bound to option-up / option-down in
+# ~/.tmux.conf.
+#
+#   claude-move <session> <window-id> up|down
+#
+# Moves the given window one place along the sidebar, by swapping it with its
+# neighbour. The sidebar draws its rows in window-index order, so swapping the
+# two indices is what moves the row. Window ids do not change, so every id the
+# notification hooks recorded stays valid.
+#
+# You stay in the window you moved. tmux keeps the active window pointed at the
+# window rather than at the index, but swap-window without -d re-selects the
+# source, so -d plus an explicit select-window makes the outcome the same
+# whichever window was active.
+#
+# The launcher window is left out of the ordering. It holds no Claude instance,
+# the sidebar hides it, and the "+" row stands for it, so it must never trade
+# places with a real session. Skipping it here also means a session can move
+# past it without stopping.
+#
+# At either end of the list the key does nothing. It does not wrap: wrapping
+# would move the top row to the bottom, which reads as a reshuffle rather than a
+# nudge.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+SESSION=${1:-}
+WIN=${2:-}
+DIR=${3:-up}
+[[ -n "$SESSION" && -n "$WIN" ]] || exit 0
+
+# The launcher has no place in the ordering, so pressing the key there is a
+# no-op rather than an error.
+launcher=$(tmux display-message -p -t "$WIN" '#{@claude_launcher}' 2>/dev/null)
+[[ "$launcher" == "1" ]] && exit 0
+
+# Instance windows top to bottom, as ids. tmux lists them in index order, which
+# is the order the sidebar draws.
+ids=($(tmux list-windows -t "$SESSION" \
+  -F '#{window_id} #{@claude_launcher}' 2>/dev/null \
+  | awk '$2 != "1" { print $1 }'))
+n=${#ids[@]}
+(( n < 2 )) && exit 0
+
+pos=-1
+for (( i = 0; i < n; i++ )); do
+  [[ "${ids[$i]}" == "$WIN" ]] && { pos=$i; break; }
+done
+(( pos < 0 )) && exit 0
+
+if [[ "$DIR" == "up" ]]; then
+  (( pos == 0 )) && exit 0
+  other=${ids[$(( pos - 1 ))]}
+else
+  (( pos == n - 1 )) && exit 0
+  other=${ids[$(( pos + 1 ))]}
+fi
+
+tmux swap-window -d -s "$WIN" -t "$other" 2>/dev/null || exit 0
+
+# Keep the moved session under the cursor, and keep the cursor off the sidebar
+# pane, so a move followed by typing goes to Claude and not into the board.
+tmux select-window -t "$WIN" 2>/dev/null
+pane=$(tmux list-panes -t "$WIN" -F '#{pane_id} #{@claude_sidebar}' 2>/dev/null \
+  | awk '$2 != "1" { print $1; exit }')
+[[ -n "$pane" ]] && tmux select-pane -t "$pane" 2>/dev/null
+
+# Redraw every sidebar now instead of on its next one-second tick, so the row
+# appears to move with the keypress. Any byte breaks the sidebar's read; "r" (72)
+# is the same wake byte claude-tab uses. Only panes tagged @claude_sidebar are
+# targeted, so this can never type into a Claude prompt.
+while IFS= read -r p; do
+  [[ -n "$p" ]] && tmux send-keys -t "$p" -H 72 2>/dev/null
+done < <(tmux list-panes -s -t "$SESSION" \
+  -F '#{pane_id} #{@claude_sidebar}' 2>/dev/null \
+  | awk '$2 == "1" { print $1 }')
+
+exit 0
