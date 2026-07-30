@@ -1,0 +1,147 @@
+#!/bin/bash
+# claude-usage — real usage numbers for the sidebar.
+#
+# Reads the same source the /usage command uses: GET /api/oauth/usage on
+# api.anthropic.com, authenticated with the OAuth token Claude Code keeps in the
+# login keychain (service "Claude Code-credentials"). The response gives true
+# consumption, not an estimate:
+#   five_hour.utilization  percent of the 5-hour session limit used
+#   five_hour.resets_at    when that window resets, ISO 8601 UTC
+#   seven_day.*            the same for the weekly limit
+#
+# This replaced a transcript-based estimate that was wrong in kind, not just in
+# degree. That version summed token counts and showed the percentage of the
+# 5-hour window that had ELAPSED, which is unrelated to how much you have used:
+# it read 20% while the real figure was 94%.
+#
+# The token is read at run time and never written anywhere. Nothing is sent
+# except the GET to the token's own issuer. Results cache for CACHE_TTL seconds,
+# so the keychain is read about once a minute rather than on every redraw.
+#
+# Prints KEY=VALUE lines. On any failure it prints OK=0 with a reason, so the
+# caller can say "unavailable" instead of drawing a plausible wrong number.
+
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+CACHE="${TMPDIR:-/tmp}/claude-usage.cache"
+LAST="${TMPDIR:-/tmp}/claude-usage.last"     # last answer that actually worked
+FAILMARK="${CACHE}.failed"
+# The endpoint rate-limits harder than expected: a burst of calls earns
+# "rate_limit_error" for several minutes. These intervals keep steady-state usage
+# to roughly one request every three minutes across every sidebar on the machine.
+CACHE_TTL=180         # a good answer is reused this long
+FAIL_TTL=600          # a failure is reused this long, so a 429 is not hammered
+STALE_MAX=7200        # how old a last-good answer may be and still be shown
+KEYCHAIN_SERVICE="Claude Code-credentials"
+
+now=$(date +%s)
+[[ "$1" == "--fresh" ]] && rm -f "$CACHE"
+
+if [[ -f "$CACHE" ]]; then
+  mtime=$(stat -f %m "$CACHE" 2>/dev/null || echo 0)
+  # A failed lookup is held far longer than a good one. The endpoint answered 429
+  # under a burst of calls, and retrying every CACHE_TTL just prolonged it.
+  ttl=$CACHE_TTL
+  [[ -f "$FAILMARK" ]] && ttl=$FAIL_TTL
+  if (( now - mtime < ttl )); then
+    /bin/cat "$CACHE"
+    exit 0
+  fi
+fi
+
+# Several sidebars expire the cache at the same instant. mkdir is atomic, so only
+# the first one makes the request; the others serve the previous copy one more
+# time rather than piling identical calls onto the API.
+LOCK="${CACHE}.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  lockage=$(( now - $(stat -f %m "$LOCK" 2>/dev/null || echo "$now") ))
+  if (( lockage > 120 )); then
+    rmdir "$LOCK" 2>/dev/null
+  elif [[ -f "$CACHE" ]]; then
+    /bin/cat "$CACHE"
+    exit 0
+  else
+    echo "OK=0"
+    echo "ERR=busy"
+    exit 0
+  fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+# A failed lookup falls back to the last answer that worked, when it is recent
+# enough. The reset timestamp stays correct no matter how old the reading is, and
+# usage moves slowly, so a few-minute-old percentage is far more useful than a
+# blank bar. STALE carries the age in seconds for anyone who wants to check.
+emit_fail() {
+  local reason=$1 out age
+  out="OK=0"$'\n'"ERR=$reason"
+  if [[ -f "$LAST" ]]; then
+    age=$(( now - $(stat -f %m "$LAST" 2>/dev/null || echo 0) ))
+    if (( age < STALE_MAX )); then
+      out="$(/bin/cat "$LAST")"$'\n'"STALE=$age"$'\n'"ERR=$reason"
+    fi
+  fi
+  printf '%s\n' "$out" > "$CACHE"
+  : > "$FAILMARK"
+  printf '%s\n' "$out"
+  exit 0
+}
+
+# ~/.claude/.credentials.json still exists but goes stale; the keychain copy is
+# the one Claude Code refreshes. Read that, and fall back to the file only if the
+# keychain read fails outright.
+creds=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w 2>/dev/null)
+if [[ -z "$creds" ]]; then
+  creds=$(/bin/cat "$HOME/.claude/.credentials.json" 2>/dev/null)
+fi
+[[ -n "$creds" ]] || emit_fail "no-credentials"
+
+token=$(printf %s "$creds" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+[[ -n "$token" ]] || emit_fail "no-token"
+
+body=$(curl -sS --max-time 8 \
+  -H "Authorization: Bearer $token" \
+  -H "anthropic-beta: oauth-2025-04-20" \
+  -H "User-Agent: claude-cli/2.1.220 (external, cli)" \
+  -w '\n%{http_code}' \
+  https://api.anthropic.com/api/oauth/usage 2>/dev/null)
+code=${body##*$'\n'}
+json=${body%$'\n'*}
+
+[[ "$code" == "200" ]] || emit_fail "http-${code:-none}"
+
+# resets_at looks like 2026-07-30T04:30:00.424484+00:00. Drop the offset, then
+# the fractional seconds, then read the rest as UTC.
+iso_to_epoch() {
+  local s=${1:-}
+  [[ -n "$s" ]] || return 1
+  s=$(printf %s "$s" | sed -E 's/(Z|[+-][0-9]{2}:?[0-9]{2})$//; s/\.[0-9]+$//')
+  date -j -u -f '%Y-%m-%dT%H:%M:%S' "$s" +%s 2>/dev/null
+}
+
+pct=$(printf %s "$json" | jq -r '.five_hour.utilization // empty' 2>/dev/null)
+reset_iso=$(printf %s "$json" | jq -r '.five_hour.resets_at // empty' 2>/dev/null)
+wpct=$(printf %s "$json" | jq -r '.seven_day.utilization // empty' 2>/dev/null)
+wreset_iso=$(printf %s "$json" | jq -r '.seven_day.resets_at // empty' 2>/dev/null)
+
+[[ -n "$pct" ]] || emit_fail "no-five-hour"
+
+# Percentages arrive as floats (94.0). Round to a whole number for display.
+pct=$(printf '%.0f' "$pct" 2>/dev/null || echo 0)
+[[ -n "$wpct" ]] && wpct=$(printf '%.0f' "$wpct" 2>/dev/null || echo "")
+
+reset_at=$(iso_to_epoch "$reset_iso") || reset_at=""
+wreset_at=$(iso_to_epoch "$wreset_iso") || wreset_at=""
+
+{
+  echo "OK=1"
+  echo "PCT=$pct"
+  [[ -n "$reset_at" ]] && echo "RESET_AT=$reset_at"
+  [[ -n "$wpct" ]] && echo "WEEK_PCT=$wpct"
+  [[ -n "$wreset_at" ]] && echo "WEEK_RESET_AT=$wreset_at"
+} > "$CACHE"
+
+# Keep a copy as the fallback for future failures, and clear the back-off marker.
+/bin/cp -f "$CACHE" "$LAST" 2>/dev/null
+/bin/rm -f "$FAILMARK"
+
+/bin/cat "$CACHE"
