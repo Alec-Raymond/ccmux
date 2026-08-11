@@ -1,0 +1,99 @@
+#!/bin/bash
+# claude-shells — which board windows currently hold an open shell.
+# Prints the window indices, space separated, on one line. Empty means none.
+#
+#   claude-shells [session]
+#
+# Claude Code keeps ONE persistent shell per session. It spawns on the first Bash
+# tool call and stays alive until the session ends, which is why a "cd" in one
+# Bash call is still in effect on the next. So a hit here means "this session has
+# opened a shell and still holds it", not "a command is running this instant".
+#
+# Detection walks the process tree. For every shell process on the machine, climb
+# the parent chain and see whether it reaches the pid of some window's Claude
+# pane. Sidebar panes are excluded, since a sidebar is itself a bash process and
+# would match every window.
+#
+# CACHING IS NOT OPTIONAL. A full process scan costs about 80ms. There is one
+# sidebar per window and each redraws every second, so a 14-window board would
+# ask 14 times a second — more than a full core. The answer is cached in $TMPDIR
+# and recomputed at most every TTL seconds by whichever caller takes the lock.
+# Everyone else reads the file. Same shape as claude-usage.
+#
+# The cache line begins with the epoch it was written: "<epoch> <idx> <idx>...".
+# That lets the sidebar judge freshness with bash builtins alone, reading the
+# file with "read < file" and comparing numbers. Calling out to stat, or running
+# this script just to be told the cache is warm, costs a fork per redraw per
+# sidebar, which was itself a third of a core. The sidebar therefore never runs
+# this script on its drawing path — it re-runs it in the BACKGROUND only when the
+# stamp has aged past TTL, and keeps drawing the previous answer meanwhile.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+S=${1:-claude}
+TTL=3
+STALE_LOCK=30       # seconds before a lock left by a killed process is broken
+TMP=${TMPDIR:-/tmp}
+socket=${TMUX%%,*}
+sockid=${socket##*/}
+CACHE="$TMP/claude-shells.${sockid:-default}.$S.$UID"
+LOCK="$CACHE.lock"
+
+now=$(date +%s)
+age_of() {          # age_of <path> -> seconds, or a huge number if absent
+  local m
+  m=$(stat -f %m "$1" 2>/dev/null) || { printf '999999'; return; }
+  printf '%s' $(( now - m ))
+}
+
+# Serve the cache while it is young enough.
+if [[ -f "$CACHE" ]] && (( $(age_of "$CACHE") < TTL )); then
+  cat "$CACHE"
+  exit 0
+fi
+
+# A lock older than STALE_LOCK belonged to a process that died holding it.
+# Without this the board would freeze on one answer for the rest of the session.
+if [[ -d "$LOCK" ]] && (( $(age_of "$LOCK") > STALE_LOCK )); then
+  rmdir "$LOCK" 2>/dev/null
+fi
+
+# One process recomputes; the others serve the stale file rather than wait. A
+# redraw must never block on this.
+if ! mkdir "$LOCK" 2>/dev/null; then
+  [[ -f "$CACHE" ]] && cat "$CACHE"
+  exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+# "index:pid," per non-sidebar pane. Joined on one line because awk -v cannot
+# carry a newline in its value.
+panes=$(tmux list-panes -s -t "$S" \
+  -F '#{window_index}:#{pane_pid}:#{@claude_sidebar}' 2>/dev/null \
+  | awk -F: '$3 != "1" { printf "%s:%s,", $1, $2 }')
+
+out=$(ps -axo pid=,ppid=,comm= | awk -v panes="$panes" '
+  BEGIN {
+    n = split(panes, a, ",")
+    for (i = 1; i <= n; i++) if (a[i] != "") { split(a[i], b, ":"); root[b[2]] = b[1] }
+  }
+  { ppid[$1] = $2; c = $3; sub(/.*\//, "", c); comm[$1] = c }
+  END {
+    for (p in comm) {
+      c = comm[p]
+      if (c != "zsh" && c != "bash" && c != "sh" && c != "fish" && c != "dash") continue
+      q = p; d = 0
+      # d guards against a parent cycle, which cannot happen on a sane system but
+      # would hang the sidebar if it did.
+      while (q != "" && q != "1" && d < 20) {
+        if (q in root) { hit[root[q]] = 1; break }
+        q = ppid[q]; d++
+      }
+    }
+    out = ""
+    for (w in hit) out = out " " w
+    print out
+  }')
+
+# Stamp first, indices after. Written to a sibling then renamed, so a reader
+# never sees a half-written line.
+printf '%s%s\n' "$now" "$out" > "$CACHE.$$" 2>/dev/null && mv -f "$CACHE.$$" "$CACHE" 2>/dev/null
+printf '%s%s\n' "$now" "$out"
