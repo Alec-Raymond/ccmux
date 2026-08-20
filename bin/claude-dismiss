@@ -1,0 +1,31 @@
+#!/bin/bash
+# claude-dismiss — clear one session's macOS alert when you open its window.
+#
+#   claude-dismiss <window-id>
+#
+# ~/.tmux.conf calls this from the after-select-window hook, so every way of
+# opening an instance goes through it: a click on a sidebar row, option-tab,
+# ctrl-b <number>, the ctrl-b Tab picker, and the jump that clicking the alert
+# itself performs. Selecting a window is the one signal that means "I am looking
+# at this instance now", and it can only come from the terminal, so an alert is
+# never cleared while you are away in another app.
+#
+# Until you reply, ~/.claude/hooks/claude-notify.sh leaves @claude_state set, so
+# the row keeps its state and the sidebar's own seen/left stamps are unchanged.
+# Only the notification goes.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+NOTIFIER="$HOME/.claude/hooks/Claude Code.app/Contents/MacOS/terminal-notifier"
+
+win=${1:-}
+[[ -n "$win" ]] || exit 0
+
+# The session id of the Claude instance in that window, published by the notify
+# hook. Empty for the launcher window and for any window whose session has not
+# run a hook yet; nothing to remove in either case.
+sid=$(tmux display-message -p -t "$win" '#{@claude_sid}' 2>/dev/null)
+[[ -n "$sid" ]] || exit 0
+
+# -remove only works through the bundle that posted, and spawning it costs about
+# a tenth of a second. Detach it so the window switch never waits on Cocoa.
+"$NOTIFIER" -remove "claude-$sid" >/dev/null 2>&1 &
+exit 0

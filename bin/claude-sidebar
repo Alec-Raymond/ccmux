@@ -1,0 +1,545 @@
+#!/bin/bash
+# claude-sidebar — the session board pane.
+#
+# Layout, top to bottom:
+#   1  progress bar and percent through the current 5-hour limit window
+#   2  the time that window resets
+#   3  how long until it resets
+#   4  one row per Claude Code window
+#   5  a "+" row at the bottom
+#
+# Clicking a row switches to that window. Clicking the "x" at its right edge
+# closes that window. Clicking "+" opens the directory picker.
+#
+# Each row carries two independent markers.
+#
+# The DOT, left of the title, is news. It means an alert arrived that you have
+# not opened yet. Amber says Claude is blocked on you (Ping), blue says the turn
+# finished (Glass). Opening the session clears it, and it never comes back — a
+# dot answers "what happened while I was away", so it is only ever new.
+#
+# The MARKER, under the "x" on the path line, is what the session is doing. It is
+# grey, the same grey as the "x" and the path, because it reports activity rather
+# than urgency and should sit in the background.
+#   | / ─ \   a spinner. Claude is generating right now.
+#   $         Claude holds an open shell.
+#   blank     neither.
+# The spinner wins when both are true, which is the normal case while a Bash
+# command runs. It steps about every three seconds and comes round in about
+# twelve, slow on purpose: a marker on every busy row, flickering once a second,
+# was more distracting than useful. SPINEVERY sets the rate.
+#
+# State lives in tmux window options, so every sidebar sees the same thing:
+#   @claude_state  needs-input | done | unset   written by claude-notify.sh
+#   @claude_seen   epoch you were last in the window with an alert outstanding
+#   @claude_left   epoch you last left the window after seeing it. Nothing draws
+#                  from this any more, now that the dot does not return. It is
+#                  still maintained because claude-notify.sh clears it alongside
+#                  the other two, and because marking a revisited row would need
+#                  it again.
+#
+# One copy runs per tmux window: a tmux pane cannot span windows, so the
+# after-new-window hook in ~/.tmux.conf gives every window its own.
+
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+if [[ -z "$TMUX" || -z "$TMUX_PANE" ]]; then
+  echo "claude-sidebar must run inside tmux" >&2
+  exit 1
+fi
+
+self=$TMUX_PANE
+tmux set-option -p -t "$self" @claude_sidebar 1 2>/dev/null
+tmux select-pane -t "$self" -T sidebar 2>/dev/null
+session=$(tmux display-message -p -t "$self" '#{session_name}')
+
+USAGE=$HOME/.local/bin/claude-usage
+SHELLS=$HOME/.local/bin/claude-shells
+# Keyed by tmux socket as well as session name: two servers can each hold a
+# session called "claude", and they must not share one answer.
+socket=${TMUX%%,*}
+SHELLCACHE="${TMPDIR:-/tmp}/claude-shells.${socket##*/}.$session.$UID"
+SHELLTTL=3          # seconds before the shell answer is refreshed in background
+# Spinner frames. An ARRAY, not a string: the dash is U+2500 (a full-cell rule,
+# the same glyph as the row separators), and ${SPIN:i:1} slices by BYTE under a
+# non-UTF-8 locale, which would cut a three-byte character into thirds.
+SPIN=('|' '/' '─' '\')
+# Redraws per spinner step. The spinner is ambient, not something to watch, so it
+# ticks about once every three seconds and takes roughly twelve to come round.
+# Raise this to calm it further, lower it to speed it up.
+SPINEVERY=3
+# Redraws so far. The frame is this counter divided by SPINEVERY, NOT the wall
+# clock.
+#
+# It was "now % 4" and it skipped frames. A redraw takes real time, so successive
+# redraws land a little over a second apart; the second they read therefore
+# advances by 1 or by 2, and on 2 the frame jumped a step. Watching it gave
+# \ / - | rather than a rotation. Most of that overshoot is not CPU — the sidebar
+# uses about 0.3% of a core — it is waiting on the tmux server, which is slow to
+# answer when the machine is loaded. Counting redraws sidesteps the whole problem:
+# every step is exactly one frame, whatever the loop period does.
+#
+# The cost is that separate sidebars no longer turn in phase, which is invisible.
+# Only the current window's sidebar is on screen at any moment.
+TICK=0
+# A turn that has been "generating" for an hour is a leftover from a session that
+# died without running its Stop hook. Stop spinning rather than spin forever.
+BUSYMAX=3600
+
+# Each colour sets its own intensity (22 = normal, 1 = bold), so a row can switch
+# colours mid-line without a full reset that would also drop a background set at
+# the start of the line.
+DIM=$'\033[22;38;5;243m'
+MID=$'\033[22;38;5;249m'
+WHT=$'\033[1;38;5;255m'
+AMB=$'\033[1;38;5;214m'
+# The activity marker is grey, the same grey as the "x" above it and the path
+# beside it, so it reads as chrome rather than as an alert. It was the terminal's
+# default foreground, which came out near-white and pulled the eye.
+MRK="$DIM"
+BLU=$'\033[1;38;5;75m'
+GRN=$'\033[22;38;5;108m'
+RED=$'\033[1;38;5;203m'
+# The Option-Tab highlight: one background and one foreground for the whole row.
+# A neutral grey deliberately, so it never competes with the amber/blue dots.
+SEL=$'\033[48;5;238m\033[22;38;5;255m'
+RST=$'\033[0m'
+
+# Turn off terminal echo for this pane. Mouse reports arrive as escape sequences
+# on stdin; any that land while the script is drawing rather than inside a read
+# get echoed by the tty driver, which is what printed bursts of junk like
+# "[<0;41;19M" into the sidebar after a click that hit no row. Echo off means the
+# driver never prints them, whether this script consumes them or not.
+saved_stty=$(stty -g 2>/dev/null)
+stty -echo -echoctl 2>/dev/null
+
+cleanup() {
+  printf '\033[?1006l\033[?1000l\033[?25h\033[?7h'
+  [[ -n "$saved_stty" ]] && stty "$saved_stty" 2>/dev/null
+  exit 0
+}
+trap cleanup INT TERM
+# ?25l hides the cursor, ?1000h/?1006h ask for SGR mouse reports, and ?7l turns
+# OFF auto-wrap. Without ?7l a line that fills the final column wraps, and the
+# newline that follows it then lands a row lower than intended, so every
+# full-width rule would push the rows below it out of place.
+printf '\033[?25l\033[?1000h\033[?1006h\033[?7l'
+
+# Click map, indexed by screen row. Bash 3.2 has no associative arrays.
+row_kind=()         # "win" | "add" | ""
+row_win=()          # window index for "win" rows
+PW=28               # pane width at last draw
+XCOL=27             # column the "x" sits in at last draw
+
+meter() {           # meter <percent> <width>
+  # Whole cells only: "█" for the used part, "░" for the rest.
+  #
+  # This used to carry a partial eighth-width block (▏▎▍▌▋▊▉) in the boundary
+  # cell for sub-cell resolution. Ghostty draws "░" by filling the cell at 25%
+  # alpha, not as a dither, so the partial block sat between two flat fields as a
+  # narrow full-brightness sliver — it read as a divider ruled across the bar
+  # rather than as the end of the fill. Whole cells leave exactly one edge.
+  #
+  # Round to the nearest cell rather than truncating: truncation put 99% at 20 of
+  # 21 cells, which reads as about 95%. The two clamps below keep rounding from
+  # lying in the other direction at the ends of the scale.
+  local pct=$1 w=$2 i out="" cells
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  cells=$(( (pct * w + 50) / 100 ))
+  # Any real usage shows at least one cell, and only a real 100% fills the bar,
+  # so an empty bar and a full bar each mean one thing.
+  (( pct > 0 && cells < 1 )) && cells=1
+  (( pct < 100 && cells > w - 1 )) && cells=$(( w - 1 ))
+  for (( i = 0; i < cells; i++ )); do out+="█"; done
+  for (( i = cells; i < w; i++ )); do out+="░"; done
+  printf '%s' "$out"
+}
+
+hms() {             # 14400 -> "4h 00m" ; 2040 -> "34m"
+  local s=$1
+  (( s < 0 )) && s=0
+  if (( s >= 3600 )); then
+    printf '%dh %02dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+  else
+    printf '%dm' $(( s / 60 ))
+  fi
+}
+
+clock() {           # epoch -> "9:02p"
+  printf '%s%s' "$(date -r "$1" '+%-l:%M')" \
+                "$(date -r "$1" '+%p' | tr 'APM' 'apm' | cut -c1)"
+}
+
+# claude-usage reports real consumption from the /api/oauth/usage endpoint:
+# PCT is the percent of the 5-hour session limit used, RESET_AT is when it
+# resets. OK=0 means it could not be read, and nothing is drawn rather than a
+# number that looks real.
+read_usage() {
+  U_OK=0 U_PCT=0 U_RESET=0
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      OK)       U_OK=$v ;;
+      PCT)      U_PCT=$v ;;
+      RESET_AT) U_RESET=$v ;;
+    esac
+  done < <("$USAGE" 2>/dev/null)
+}
+
+draw() {
+  local now w maxn maxp pct barc cand candat sel rule i
+  local shline shstamp shells
+  local idx wid active state seen left launcher title dir cpath name busy phase
+  local label short slen pad p plen ppad dkey dupn k suffix
+  local dot dotc mark namec buf row rows
+
+  TICK=$(( TICK + 1 ))
+  now=$(date +%s)
+
+  # The Option-Tab candidate: the row you would land on if you stopped pressing.
+  # claude-tab sets it and clears it on commit; the age check is a backstop in
+  # case that process dies mid-cycle and leaves the highlight stuck on.
+  cand=$(tmux show-options -t "$session" -qv @claude_tab_target 2>/dev/null)
+  candat=$(tmux show-options -t "$session" -qv @claude_tab_at 2>/dev/null)
+  if [[ -z "$candat" ]] || (( now - candat > 2 )); then
+    cand=""
+  fi
+  w=$(tmux display-message -p -t "$self" '#{pane_width}' 2>/dev/null)
+  [[ -z "$w" || "$w" -lt 16 ]] && w=16
+  PW=$w
+  XCOL=$(( w - 1 ))
+  # Title line is: space + dot + two spaces + title(maxn) + gap + x, ending at
+  # XCOL. The gap is part of the budget so a title long enough to be ellipsized
+  # still cannot run into the x.
+  maxn=$(( w - 7 ))
+  # Path line is: four spaces + path(maxp) + gap + marker, ending at XCOL, so it
+  # mirrors the title line and the marker lands directly under the "x".
+  #
+  # This was w - 5, which let a full-length path reach XCOL itself. The column is
+  # now reserved on every row, whether that row has a marker or not, so a session
+  # going blocked never reflows its own path. Cost: two characters less path.
+  maxp=$(( w - 7 ))
+
+  # Horizontal rule separating the usage block and each instance. Exactly the
+  # pane width, so both ends meet the pane edges and the rule reads as joining
+  # the vertical border tmux draws alongside. Filling the last column is only safe
+  # because auto-wrap is turned off at startup.
+  rule=""
+  i=0
+  while (( i < w )); do rule+="─"; i=$((i + 1)); done
+
+  # Which windows hold an open shell, read straight out of the cache file with
+  # builtins. No fork on the drawing path: this runs once a second in each of
+  # however many sidebars exist, and even a single "stat" per redraw per sidebar
+  # measured at a third of a core on a 14-window board.
+  #
+  # The cache line is "<epoch> <idx> <idx>...". When the stamp ages past
+  # SHELLTTL, claude-shells is re-run in the BACKGROUND and this redraw keeps the
+  # previous answer. Whether a session holds a shell changes at most once per
+  # session, so lag of a few seconds never shows.
+  shline=""
+  [[ -r "$SHELLCACHE" ]] && IFS= read -r shline < "$SHELLCACHE" 2>/dev/null
+  shstamp=${shline%% *}
+  case "$shstamp" in ''|*[!0-9]*) shstamp=0 ;; esac
+  shells=""
+  [[ "$shline" == *' '* ]] && shells=" ${shline#* } "
+  if (( now - shstamp >= SHELLTTL )); then
+    "$SHELLS" "$session" >/dev/null 2>&1 &
+  fi
+
+  buf=""; row=0
+  row_kind=(); row_win=()
+  # Reset per draw: counts how many rows so far share each project directory.
+  dupkey=(); dupcount=()
+  emit() {          # emit <text> <kind> <window-index>
+    buf+=$'\033[K'"$1"$'\n'
+    row=$((row+1))
+    row_kind[$row]="$2"
+    row_win[$row]="$3"
+  }
+
+  # ---- usage --------------------------------------------------------------
+  read_usage
+  if [[ "$U_OK" == "1" ]]; then
+    pct=$U_PCT
+    (( pct < 0 )) && pct=0
+    (( pct > 100 )) && pct=100
+    # Colour tracks how close the limit is, since the number alone is easy to
+    # skim past at a glance.
+    barc=$GRN
+    (( pct >= 75 )) && barc=$AMB
+    (( pct >= 90 )) && barc=$RED
+    emit "$(printf '%s%s%s %3d%%%s' \
+      "$barc" "$(meter "$pct" $(( w - 7 )) )" "$MID" "$pct" "$RST")" "" ""
+    if (( U_RESET > 0 )); then
+      emit "$(printf '%sresets %s · in %s%s' \
+        "$DIM" "$(clock "$U_RESET")" "$(hms $(( U_RESET - now )))" "$RST")" "" ""
+    else
+      emit "" "" ""
+    fi
+  else
+    emit "$(printf '%s%s%s    –%s' \
+      "$DIM" "$(meter 0 $(( w - 7 )) )" "$MID" "$RST")" "" ""
+    emit "${DIM}usage unavailable${RST}" "" ""
+  fi
+  emit "${DIM}${rule}${RST}" "" ""
+
+  # ---- one row per window -------------------------------------------------
+  rows=0
+  while IFS='|' read -r idx wid active state seen left launcher title dir cpath name busy; do
+    [[ -z "$idx" ]] && continue
+    # The launcher window is not an instance. The "+" row represents it.
+    [[ "$launcher" == "1" ]] && continue
+    rows=$((rows + 1))
+
+    # Keep the seen/left stamps current. Written only on a transition, so this
+    # is a couple of tmux calls per switch, not per redraw.
+    if [[ "$active" == "1" ]]; then
+      [[ -n "$state" && -z "$seen" ]] && {
+        tmux set-option -w -t "$session:$idx" @claude_seen "$now" 2>/dev/null
+        seen=$now
+      }
+      [[ -n "$left" ]] && {
+        tmux set-option -w -t "$session:$idx" -u @claude_left 2>/dev/null
+        left=""
+      }
+    else
+      [[ -n "$seen" && -z "$left" ]] && {
+        tmux set-option -w -t "$session:$idx" @claude_left "$now" 2>/dev/null
+        left=$now
+      }
+    fi
+
+    # Dot: an alert you have not opened yet. Amber if Claude is blocked on you,
+    # blue if the turn finished. It goes out the moment you open the session and
+    # does NOT return. Two earlier versions made it come back a minute after you
+    # left without replying — first in its own colour, then in red — and both
+    # were rejected as noise. The dot is therefore the ONLY place an unanswered
+    # alert shows, and it shows once: a session you opened and walked away from
+    # without replying is now indistinguishable from one you dealt with. The
+    # marker below reports activity, not whether anyone is waiting on you.
+    dot=" "; dotc="$DIM"
+    if [[ -n "$state" && -z "$seen" ]]; then
+      dot="●"
+      [[ "$state" == "needs-input" ]] && dotc="$AMB" || dotc="$BLU"
+    fi
+
+    # Marker: what this session is doing. Spinner while generating, "$" while it
+    # holds a shell, blank otherwise. Generating wins, since a running Bash
+    # command satisfies both and "still working" is the more useful of the two.
+    # Each row starts on its own frame, so several sessions generating at once
+    # do not present one blinking column. They still all step together, on the
+    # same redraw; only the starting position differs.
+    #
+    # The offset comes from the tmux window ID, not the window index. An index
+    # shifts whenever a window closes (renumber-windows) or you reorder the board
+    # with option-up, and the phase would visibly jump. An ID is fixed for the
+    # life of the window. Deterministic rather than actually random, so the board
+    # also looks identical from whichever window you view it in.
+    phase=${wid#@}
+    case "$phase" in ''|*[!0-9]*) phase=0 ;; esac
+    mark=" "
+    if [[ "$busy" =~ ^[0-9]+$ ]] && (( now - busy < BUSYMAX )); then
+      mark=${SPIN[$(( (TICK / SPINEVERY + phase) % ${#SPIN[@]} ))]}
+    elif [[ -n "$shells" && "$shells" == *" $idx "* ]]; then
+      mark='$'
+    fi
+
+    # Label the row with the session topic — the same text the notification uses
+    # as its title, published to @claude_title by claude-notify.sh. Until a
+    # session has one, fall back to the folder name.
+    label=${title:-$name}
+    if (( ${#label} > maxn )); then
+      short="${label:0:$(( maxn - 1 ))}…"
+      slen=$maxn
+    else
+      short=$label
+      slen=${#label}
+    fi
+    # Pad with %*s over an empty string: a multibyte "…" cannot skew the width.
+    # The +1 is the guaranteed gap before the x.
+    pad=$(( maxn - slen + 1 ))
+    namec="$MID"
+    [[ "$active" == "1" ]] && namec="$WHT"
+
+    # Is this the Option-Tab candidate?
+    sel=0
+    [[ -n "$cand" && "$idx" == "$cand" ]] && sel=1
+
+    if (( sel )); then
+      # One style for the entire row. Reverse video was used here before, but it
+      # turns each element's FOREGROUND colour into its background, so the dot,
+      # the title and the x each produced a differently coloured block and the row
+      # came out striped. Dropping the per-element colours fixes that.
+      #
+      # The trailing \033[K erases to the end of the line while the highlight is
+      # still the active style, which paints every remaining column with it. That
+      # is what carries the band to the pane edge; padding with spaces stopped at
+      # the last character written.
+      emit "$(printf '%s %s  %s%*sx\033[K%s' \
+        "$SEL" "$dot" "$short" "$pad" "" "$RST")" "win" "$idx"
+    else
+      emit "$(printf ' %s%s  %s%s%*s%sx%s' \
+        "$dotc" "$dot" "$namec" "$short" "$pad" "" "$DIM" "$RST")" \
+        "win" "$idx"
+    fi
+
+    # Second line: the folder name alone, not the path leading to it. @claude_dir
+    # is set when the board opens the window; pane_current_path covers windows
+    # made some other way.
+    dkey=${dir:-$cpath}
+    dkey=${dkey%/}
+    p=$dkey
+    if [[ "$p" == "$HOME" ]]; then
+      p=home                     # "alecraymond" reads as noise, as in the titles
+    else
+      p=${p##*/}
+    fi
+
+    # Several instances can now run in one folder, and until each is given a
+    # topic every one of their rows says the same thing. Number them in order, so
+    # the second onward is distinguishable. Bash 3.2 has no associative arrays,
+    # hence the parallel-array scan; the key is the full path, because two
+    # different projects can share a folder name.
+    dupn=0
+    k=0
+    while (( k < ${#dupkey[@]} )); do
+      if [[ "${dupkey[$k]}" == "$dkey" ]]; then
+        dupcount[$k]=$(( dupcount[k] + 1 ))
+        dupn=${dupcount[$k]}
+        break
+      fi
+      k=$(( k + 1 ))
+    done
+    if (( dupn == 0 )); then
+      dupkey[$k]=$dkey
+      dupcount[$k]=1
+      dupn=1
+    fi
+    suffix=""
+    (( dupn > 1 )) && suffix=" $dupn"
+
+    # Trims on the right now: a folder name reads from its start.
+    #
+    # plen is tracked rather than measured after the fact. Once the string holds
+    # an ellipsis it carries a multibyte character, and %*s padding computed from
+    # its byte-or-character length is exactly the skew the title line already
+    # avoids. A truncated path is maxp columns wide by construction.
+    plen=$(( ${#p} + ${#suffix} ))
+    if (( plen > maxp )); then
+      p="${p:0:$(( maxp - ${#suffix} - 1 ))}…"
+      plen=$maxp
+    fi
+    p="${p}${suffix}"
+    # The +1 is the guaranteed gap before the marker, same rule as the title's x.
+    ppad=$(( maxp - plen + 1 ))
+    if (( sel )); then
+      # Same erase-to-end trick, so both lines of the highlighted instance form
+      # one unbroken block. The marker keeps its position but takes the
+      # highlight's own foreground, since a separately coloured glyph inside the
+      # band comes out as a differently coloured block.
+      emit "$(printf '%s    %s%*s%s\033[K%s' \
+        "$SEL" "$p" "$ppad" "" "$mark" "$RST")" "winpath" "$idx"
+    else
+      emit "$(printf '    %s%s%*s%s%s%s' \
+        "$DIM" "$p" "$ppad" "" "$MRK" "$mark" "$RST")" "winpath" "$idx"
+    fi
+    emit "${DIM}${rule}${RST}" "" ""
+  done < <(tmux list-windows -t "$session" \
+    -F '#{window_index}|#{window_id}|#{window_active}|#{@claude_state}|#{@claude_seen}|#{@claude_left}|#{@claude_launcher}|#{@claude_title}|#{@claude_dir}|#{pane_current_path}|#{window_name}|#{@claude_busy}' \
+    2>/dev/null)
+
+  if (( rows == 0 )); then
+    emit "${DIM}    no instances${RST}" "" ""
+    emit "${DIM}${rule}${RST}" "" ""
+  fi
+
+  # ---- add ----------------------------------------------------------------
+  # The rule closing the last instance doubles as the separator above "+".
+  emit "$(printf ' %s+%s' "$GRN" "$RST")" "add" ""
+
+  printf '\033[H%s\033[J' "$buf"
+}
+
+switch_to() {
+  local idx="$1" pane
+  tmux select-window -t "$session:$idx" 2>/dev/null || return 0
+  pane=$(tmux list-panes -t "$session:$idx" \
+    -F '#{pane_id} #{@claude_sidebar}' 2>/dev/null \
+    | awk '$2 != "1" { print $1; exit }')
+  [[ -n "$pane" ]] && tmux select-pane -t "$pane" 2>/dev/null
+}
+
+close_window() {
+  tmux kill-window -t "$session:$1" 2>/dev/null
+}
+
+open_picker() {
+  # Switches to the launcher window, so the new-instance screen appears in the
+  # main pane where a Claude terminal sits. Not a floating popup.
+  "$HOME/.local/bin/claude-new" "$session" >/dev/null 2>&1
+}
+
+# Read one SGR mouse report if that is what is pending: \033[<btn;col;rowM
+# Timeouts are whole seconds: /bin/bash is 3.2, which rejects "-t 0.05" outright
+# and returns failure, which silently killed every click. The bytes of a report
+# arrive together, so an integer timeout costs no latency in practice.
+read_mouse() {
+  local c seq=""
+  IFS= read -rsn1 -t 1 c || return 1
+  [[ "$c" == "[" ]] || return 1
+  IFS= read -rsn1 -t 1 c || return 1
+  [[ "$c" == "<" ]] || return 1
+  while IFS= read -rsn1 -t 1 c; do
+    case "$c" in
+      M) printf '%s' "$seq"; return 0 ;;   # press
+      m) return 1 ;;                       # release, ignore
+      *) seq+="$c" ;;
+    esac
+  done
+  return 1
+}
+
+handle_click() {    # handle_click <col> <row>
+  local col="$1" r="$2"
+  case "${row_kind[$r]}" in
+    win)
+      # The x sits in column XCOL; accept a click one column either side of it.
+      if (( col >= XCOL - 1 && col <= XCOL + 1 )); then
+        close_window "${row_win[$r]}"
+      else
+        switch_to "${row_win[$r]}"
+      fi
+      ;;
+    winpath)
+      # The path line carries no x, so anywhere on it just switches.
+      switch_to "${row_win[$r]}"
+      ;;
+    add) open_picker ;;
+  esac
+}
+
+while :; do
+  # Claude exiting (ctrl-c, /exit, a crash) kills its pane, leaving this sidebar
+  # alone in the window. Close with it, which is what removes the window.
+  # The launcher window is exempt: it has to survive so there is always a
+  # new-instance screen to fall back to.
+  panes=$(tmux list-panes -t "$self" -F x 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$panes" == "1" ]]; then
+    mine=$(tmux display-message -p -t "$self" '#{@claude_launcher}' 2>/dev/null)
+    [[ "$mine" != "1" ]] && cleanup
+  fi
+
+  draw
+
+  IFS= read -rsn1 -t 1 key || continue
+  if [[ "$key" == $'\033' ]]; then
+    if report=$(read_mouse); then
+      btn=${report%%;*}
+      rest=${report#*;}
+      clickcol=${rest%%;*}
+      clickrow=${rest##*;}
+      [[ "$btn" == "0" ]] && handle_click "$clickcol" "$clickrow"
+    fi
+  fi
+done
